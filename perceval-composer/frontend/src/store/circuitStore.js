@@ -1,7 +1,7 @@
 // circuitStore.js — Zustand global state for the Perceval Composer
 import { create } from 'zustand';
 import { addEdge, applyNodeChanges, applyEdgeChanges } from 'reactflow';
-import { generatePercevalCode } from '../utils/codeGenerator';
+import { generatePercevalCode, patchReferenceCode } from '../utils/codeGenerator';
 import { runCode, loadCHSH } from '../utils/api';
 
 let nodeIdCounter = 1;
@@ -9,41 +9,83 @@ let nodeIdCounter = 1;
 const defaultNodes = [];
 const defaultEdges = [];
 
+/** React Flow layout updates — must not replace loaded testcase Python. */
+function isCosmeticNodeChange(changes) {
+  return (
+    changes.length > 0 &&
+    changes.every((c) => c.type === 'dimensions' || c.type === 'select')
+  );
+}
+
+function isStructuralEdgeChange(changes) {
+  return changes.some((c) => c.type === 'add' || c.type === 'remove' || c.type === 'reset');
+}
+
 export const useCircuitStore = create((set, get) => ({
-  // ── React Flow state ───────────────────────────────────────────────────────
   nodes: defaultNodes,
   edges: defaultEdges,
 
-  // ── App state ──────────────────────────────────────────────────────────────
   generatedCode: '# Add components to the canvas to generate code',
-  results: null,       // { probabilities: [], labels: [], raw_output: '' }
+  referenceCode: null,
+  results: null,
   isRunning: false,
   error: null,
-  activeTab: 'code',   // 'code' | 'results'
+  activeTab: 'code',
 
-  // ── React Flow handlers ────────────────────────────────────────────────────
   onNodesChange: (changes) => {
     set((state) => {
       const nodes = applyNodeChanges(changes, state.nodes);
-      return { nodes, generatedCode: generatePercevalCode(nodes, state.edges) };
+
+      if (state.referenceCode && isCosmeticNodeChange(changes)) {
+        return { nodes };
+      }
+
+      const structural = changes.some(
+        (c) => c.type === 'add' || c.type === 'remove' || c.type === 'reset' || c.type === 'replace',
+      );
+
+      if (state.referenceCode && !structural) {
+        return { nodes };
+      }
+
+      return {
+        nodes,
+        referenceCode: null,
+        generatedCode: generatePercevalCode(nodes, state.edges),
+      };
     });
   },
 
   onEdgesChange: (changes) => {
     set((state) => {
       const edges = applyEdgeChanges(changes, state.edges);
-      return { edges, generatedCode: generatePercevalCode(state.nodes, edges) };
+
+      if (state.referenceCode && !isStructuralEdgeChange(changes)) {
+        return { edges };
+      }
+
+      return {
+        edges,
+        referenceCode: null,
+        generatedCode: generatePercevalCode(state.nodes, edges),
+      };
     });
   },
 
   onConnect: (connection) => {
     set((state) => {
-      const edges = addEdge({ ...connection, animated: true, style: { stroke: '#a78bfa' } }, state.edges);
-      return { edges, generatedCode: generatePercevalCode(state.nodes, edges) };
+      const edges = addEdge(
+        { ...connection, animated: true, style: { stroke: '#a78bfa' } },
+        state.edges,
+      );
+      return {
+        edges,
+        referenceCode: null,
+        generatedCode: generatePercevalCode(state.nodes, edges),
+      };
     });
   },
 
-  // ── Node creation (called on canvas drop) ─────────────────────────────────
   addNode: (type, position) => {
     const id = `${type}-${nodeIdCounter++}`;
     const defaults = {
@@ -55,19 +97,33 @@ export const useCircuitStore = create((set, get) => ({
     const newNode = { id, type, position, data: { ...defaults[type], id } };
     set((state) => {
       const nodes = [...state.nodes, newNode];
-      return { nodes, generatedCode: generatePercevalCode(nodes, state.edges) };
+      return {
+        nodes,
+        referenceCode: null,
+        generatedCode: generatePercevalCode(nodes, state.edges),
+      };
     });
   },
 
-  // ── Node data update (slider changes) ─────────────────────────────────────
   updateNodeData: (id, data) => {
     set((state) => {
-      const nodes = state.nodes.map((n) => n.id === id ? { ...n, data: { ...n.data, ...data } } : n);
-      return { nodes, generatedCode: generatePercevalCode(nodes, state.edges) };
+      const nodes = state.nodes.map((n) =>
+        n.id === id ? { ...n, data: { ...n.data, ...data } } : n,
+      );
+      const node = nodes.find((n) => n.id === id);
+
+      if (state.referenceCode && node) {
+        const generatedCode = patchReferenceCode(state.referenceCode, node, data);
+        return { nodes, referenceCode: generatedCode, generatedCode };
+      }
+
+      return {
+        nodes,
+        generatedCode: generatePercevalCode(nodes, state.edges),
+      };
     });
   },
 
-  // ── Circuit actions ────────────────────────────────────────────────────────
   runCircuit: async () => {
     const { generatedCode } = get();
     set({ isRunning: true, error: null, activeTab: 'results' });
@@ -92,6 +148,7 @@ export const useCircuitStore = create((set, get) => ({
       edges: [],
       results: null,
       error: null,
+      referenceCode: null,
       generatedCode: '# Add components to the canvas to generate code',
     });
   },
@@ -100,12 +157,15 @@ export const useCircuitStore = create((set, get) => ({
     set({ isRunning: true, error: null });
     try {
       const tc = await loadCHSH();
-      nodeIdCounter = 100; // avoid id collisions
+      nodeIdCounter = 100;
       set({
         nodes: tc.circuit_json.nodes.map((n) => ({ ...n })),
         edges: tc.circuit_json.edges.map((e) => ({
-          ...e, animated: true, style: { stroke: '#a78bfa' },
+          ...e,
+          animated: true,
+          style: { stroke: '#a78bfa' },
         })),
+        referenceCode: tc.code,
         generatedCode: tc.code,
         results: null,
         error: null,

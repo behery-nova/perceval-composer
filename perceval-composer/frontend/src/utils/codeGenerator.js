@@ -1,43 +1,165 @@
 ﻿// codeGenerator.js — Convert React Flow circuit graph → Perceval Python code
 
 /**
- * Topological sort of nodes by their x-position (left → right = circuit order).
+ * Topological sort of nodes by x-position (left → right).
  */
 function sortByPosition(nodes) {
   return [...nodes].sort((a, b) => a.position.x - b.position.x);
 }
 
-/**
- * Assign sequential mode indices to node handles.
- * Each BS gets 2 modes; PS/Mirror/Source get 1.
- */
-function assignModes(sortedNodes) {
-  let modeCounter = 0;
-  const modeMap = {}; // nodeId → { in: [modes], out: [modes] }
+function handleKey(nodeId, handleId) {
+  return `${nodeId}:${handleId}`;
+}
 
-  for (const node of sortedNodes) {
-    if (node.type === 'bs') {
-      modeMap[node.id] = { in: [modeCounter, modeCounter + 1], out: [modeCounter, modeCounter + 1] };
-      modeCounter += 2;
-    } else if (node.type === 'source') {
-      const count = node.data.photons || 1;
-      const modes = Array.from({ length: count }, (_, i) => modeCounter + i);
-      modeMap[node.id] = { in: modes, out: modes };
-      modeCounter += count;
-    } else {
-      // ps, mirror — single mode
-      modeMap[node.id] = { in: [modeCounter], out: [modeCounter] };
-      modeCounter += 1;
-    }
+function handlesForNodeType(type) {
+  switch (type) {
+    case 'source':
+      return ['out-0', 'out-1'];
+    case 'bs':
+      return ['in-0', 'in-1', 'out-0', 'out-1'];
+    case 'ps':
+    case 'mirror':
+      return ['in-0', 'out-0'];
+    default:
+      return [];
   }
-  return { modeMap, totalModes: modeCounter };
+}
+
+/** Union-find for wiring handles to shared optical modes. */
+class UnionFind {
+  constructor() {
+    this.parent = new Map();
+  }
+
+  add(key) {
+    if (!this.parent.has(key)) this.parent.set(key, key);
+  }
+
+  find(key) {
+    if (!this.parent.has(key)) this.add(key);
+    let root = key;
+    while (this.parent.get(root) !== root) root = this.parent.get(root);
+    let cur = key;
+    while (cur !== root) {
+      const next = this.parent.get(cur);
+      this.parent.set(cur, root);
+      cur = next;
+    }
+    return root;
+  }
+
+  union(a, b) {
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra !== rb) this.parent.set(rb, ra);
+  }
 }
 
 /**
- * Generate the Perceval Python code string from nodes + edges.
- * @param {object[]} nodes
- * @param {object[]} edges
- * @returns {string}
+ * Trace edges so connected ports share modes; BS uses consecutive mode pairs.
+ */
+function buildModeMap(nodes, edges) {
+  const uf = new UnionFind();
+
+  for (const node of nodes) {
+    for (const h of handlesForNodeType(node.type)) {
+      uf.add(handleKey(node.id, h));
+    }
+    if (node.type === 'bs') {
+      uf.union(handleKey(node.id, 'in-0'), handleKey(node.id, 'out-0'));
+      uf.union(handleKey(node.id, 'in-1'), handleKey(node.id, 'out-1'));
+    } else if (node.type === 'ps' || node.type === 'mirror') {
+      uf.union(handleKey(node.id, 'in-0'), handleKey(node.id, 'out-0'));
+    }
+  }
+
+  for (const edge of edges) {
+    uf.union(
+      handleKey(edge.source, edge.sourceHandle),
+      handleKey(edge.target, edge.targetHandle),
+    );
+  }
+
+  const wireToMode = new Map();
+  let nextMode = 0;
+
+  const assignWire = (root) => {
+    if (!wireToMode.has(root)) {
+      wireToMode.set(root, nextMode);
+      nextMode += 1;
+    }
+    return wireToMode.get(root);
+  };
+
+  const remapWire = (fromMode, toMode) => {
+    for (const [root, mode] of wireToMode.entries()) {
+      if (mode === fromMode) wireToMode.set(root, toMode);
+      else if (mode > fromMode) wireToMode.set(root, mode - 1);
+    }
+    nextMode -= 1;
+  };
+
+  const wireRoot = (nodeId, handleId) =>
+    uf.find(handleKey(nodeId, handleId));
+
+  const ensureAdjacent = (m0, m1) => {
+    if (m1 === m0 + 1) return;
+    if (m1 < m0) {
+      remapWire(m1, m0 + 1);
+      return;
+    }
+    // m1 > m0 + 1 — insert gap by shifting m1 down
+    remapWire(m1, m0 + 1);
+  };
+
+  const components = nodes.filter((n) => n.type !== 'source');
+  const sorted = sortByPosition(components);
+
+  for (const node of sorted) {
+    if (node.type === 'bs') {
+      const m0 = assignWire(wireRoot(node.id, 'in-0'));
+      const m1 = assignWire(wireRoot(node.id, 'in-1'));
+      ensureAdjacent(m0, m1);
+    } else if (node.type === 'ps' || node.type === 'mirror') {
+      assignWire(wireRoot(node.id, 'in-0'));
+      assignWire(wireRoot(node.id, 'out-0'));
+    }
+  }
+
+  // Unconnected handles on sources still need modes for photon injection
+  for (const node of nodes.filter((n) => n.type === 'source')) {
+    for (const h of handlesForNodeType('source')) {
+      assignWire(wireRoot(node.id, h));
+    }
+  }
+
+  const modeAt = (nodeId, handleId) => wireToMode.get(wireRoot(nodeId, handleId)) ?? 0;
+
+  const totalModes = nextMode > 0 ? nextMode : 1;
+  return { modeAt, totalModes };
+}
+
+/**
+ * Patch canonical testcase Python when UI sliders change.
+ */
+export function patchReferenceCode(code, node, data) {
+  let out = code;
+  const label = node.data?.label || '';
+
+  if (node.type === 'ps' && data.phi !== undefined) {
+    const phi = Number(data.phi);
+    if (label.includes('Alice')) {
+      out = out.replace(/^phi_alice\s*=.*$/m, `phi_alice = ${phi}`);
+    } else if (label.includes('Bob')) {
+      out = out.replace(/^phi_bob\s*=.*$/m, `phi_bob   = ${phi}`);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Generate Perceval Python from nodes + edges.
  */
 export function generatePercevalCode(nodes, edges) {
   if (!nodes || nodes.length === 0) {
@@ -47,60 +169,57 @@ export function generatePercevalCode(nodes, edges) {
   const sources = nodes.filter((n) => n.type === 'source');
   const components = nodes.filter((n) => n.type !== 'source');
   const sorted = sortByPosition(components);
-  const allSorted = [...sources, ...sorted];
-  const { modeMap, totalModes } = assignModes(allSorted);
+  const { modeAt, totalModes } = buildModeMap(nodes, edges);
 
   const lines = [
     'import perceval as pcvl',
     'import math',
     '',
     `# Generated by Perceval Composer — ${new Date().toISOString().split('T')[0]}`,
-    `circuit = pcvl.Circuit(${Math.max(totalModes, 1)})`,
+    `circuit = pcvl.Circuit(${totalModes})`,
     '',
   ];
 
-  // Component adds
   for (const node of sorted) {
-    const modes = modeMap[node.id];
-    if (!modes) continue;
-    const m0 = modes.in[0];
-
     if (node.type === 'bs') {
+      const m0 = modeAt(node.id, 'in-0');
       const theta = (node.data.theta ?? Math.PI / 4).toFixed(6);
       lines.push(`# ${node.data.label || 'Beam Splitter'}`);
       lines.push(`circuit.add(${m0}, pcvl.BS(theta=${theta}))`);
     } else if (node.type === 'ps') {
+      const m0 = modeAt(node.id, 'in-0');
       const phi = (node.data.phi ?? 0).toFixed(6);
       lines.push(`# ${node.data.label || 'Phase Shifter'}`);
       lines.push(`circuit.add(${m0}, pcvl.PS(phi=${phi}))`);
     } else if (node.type === 'mirror') {
+      const m0 = modeAt(node.id, 'in-0');
       lines.push(`# ${node.data.label || 'Mirror'}`);
       lines.push(`circuit.add(${m0}, pcvl.PERM([1, 0]))  # Mirror / SWAP`);
     }
     lines.push('');
   }
 
-  // Input state from source nodes
-  const photonList = Array(Math.max(totalModes, 1)).fill(0);
+  const photonList = Array(totalModes).fill(0);
   for (const src of sources) {
-    const modes = modeMap[src.id];
-    if (modes) {
-      modes.in.forEach((m) => { photonList[m] = 1; });
+    const count = src.data.photons || 1;
+    for (let i = 0; i < count; i++) {
+      const handle = `out-${i}`;
+      if (handlesForNodeType('source').includes(handle)) {
+        photonList[modeAt(src.id, handle)] = 1;
+      }
     }
   }
 
-  lines.push(`# Input state`);
+  lines.push('# Input state');
   lines.push(`input_state = pcvl.BasicState([${photonList.join(', ')}])`);
   lines.push('');
   lines.push('# Simulation');
-  lines.push(`backend = pcvl.BackendFactory.get_backend("Naive")`);
-  lines.push(`backend.set_circuit(circuit)`);
-  lines.push(`backend.set_input_state(input_state)`);
+  lines.push('backend = pcvl.BackendFactory.get_backend("Naive")');
+  lines.push('backend.set_circuit(circuit)');
+  lines.push('backend.set_input_state(input_state)');
   lines.push('');
-  lines.push('# Compute probability distribution');
   lines.push('_result = backend.prob_distribution()');
   lines.push('');
-  lines.push('# Print results');
   lines.push('for state, prob in _result.items():');
   lines.push('    p = float(prob)');
   lines.push('    if p > 1e-6:');
